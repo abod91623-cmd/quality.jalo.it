@@ -1,0 +1,979 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>FrameDrop · TikTok-Ready Frame Rate Converter</title>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
+
+<!-- Tailwind CSS (Play CDN — zero build step, works from a double-clicked file://) -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: {
+          inter: ['Inter', 'sans-serif'],
+          tajawal: ['Tajawal', 'sans-serif'],
+        },
+        colors: {
+          ink: '#0d0f17',
+          panel: '#12141f',
+          card: '#161826',
+          neon: '#00f2fe',
+        },
+        boxShadow: {
+          neon: '0 0 24px -4px rgba(0,242,254,0.45)',
+          violetGlow: '0 0 28px -4px rgba(139,92,246,0.5)',
+        }
+      }
+    }
+  };
+</script>
+
+<style>
+  /* The only hand-written CSS: things Tailwind utility classes can't express (RTL font swap, select arrow reset). */
+  body[dir="rtl"] { font-family: 'Tajawal', 'Inter', sans-serif; }
+  select { -webkit-appearance: none; appearance: none; }
+</style>
+</head>
+<body dir="ltr" class="bg-ink text-gray-100 font-inter min-h-screen relative overflow-x-hidden">
+
+<!-- Ambient HUD glow field: deep-ink base + violet/cyan bloom, plus a faint
+     scanline grid for a "console" feel. Pure CSS/SVG, no extra requests. -->
+<div class="fixed inset-0 pointer-events-none" style="background-image:radial-gradient(rgba(255,255,255,0.035) 1px, transparent 1px); background-size:34px 34px; mask-image:radial-gradient(ellipse 90% 70% at 50% 0%, black 40%, transparent 100%);"></div>
+<div class="fixed -top-40 -start-40 w-[560px] h-[560px] bg-violet-500 rounded-full blur-[130px] opacity-25 pointer-events-none"></div>
+<div class="fixed -bottom-44 -end-40 w-[520px] h-[520px] bg-cyan-400 rounded-full blur-[130px] opacity-[0.22] pointer-events-none"></div>
+<div class="fixed top-1/3 start-1/2 -translate-x-1/2 w-[420px] h-[280px] bg-[#00f2fe] rounded-full blur-[150px] opacity-[0.08] pointer-events-none"></div>
+
+<div id="root" class="relative z-10">
+  <!-- Shown until React takes over. If any CDN script fails, this becomes a clear error — never a blank page. -->
+  <div class="min-h-screen flex flex-col items-center justify-center gap-4 text-center px-6" id="boot-screen">
+    <div class="w-9 h-9 rounded-full border-[3px] border-white/15 border-t-cyan-400 animate-spin"></div>
+    <div class="text-gray-400 text-sm font-semibold">Loading FrameDrop…</div>
+  </div>
+</div>
+
+<script>
+  // Global safety net: if any required CDN script fails to load, replace the
+  // boot screen with a visible, actionable error instead of leaving a blank page.
+  (function () {
+    window.__frameDropReady = false;
+    window.addEventListener('error', function (e) {
+      var t = e.target;
+      if (t && t.tagName === 'SCRIPT' && !window.__frameDropReady) {
+        var root = document.getElementById('root');
+        if (root) {
+          root.innerHTML =
+            '<div class="min-h-screen flex items-center justify-center px-6">' +
+            '<div class="max-w-md bg-red-500/10 border border-red-500/30 text-red-200 rounded-2xl p-6 text-sm leading-relaxed">' +
+            '<b class="block mb-2 text-base text-red-100">\u26A0\uFE0F Couldn\'t load a required resource</b>' +
+            'This app needs an internet connection the first time it runs (to fetch React, Tailwind, Lucide and FFmpeg from a CDN). ' +
+            'Failed URL: <code class="break-all">' + (t.src || 'unknown') + '</code><br><br>' +
+            'Please check your connection and reopen this file.' +
+            '</div></div>';
+        }
+      }
+    }, true);
+  })();
+</script>
+
+<!-- React (UMD builds, pinned versions, CORS-enabled CDN — works from a double-clicked file://) -->
+<script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.7/babel.min.js" crossorigin="anonymous"></script>
+
+<!-- Lucide icons (vanilla UMD build — createIcons() scans for data-lucide attributes) -->
+<script src="https://cdn.jsdelivr.net/npm/lucide@0.451.0/dist/umd/lucide.js" crossorigin="anonymous"></script>
+
+<!--
+  FFmpeg.wasm 0.11.6 — the last single-threaded release before ffmpeg.wasm
+  switched to a SharedArrayBuffer-based multithreaded core. Deliberately
+  pinned here: SharedArrayBuffer requires the page to be served with
+  Cross-Origin-Opener-Policy / Cross-Origin-Embedder-Policy response
+  headers, which a static host you don't control the server config for —
+  GitHub Pages included — cannot set. Using 0.11.x means the app runs
+  entirely off a regular Web Worker + a classic (non-shared) ArrayBuffer,
+  so it works out-of-the-box on GitHub Pages / any static HTTPS host with
+  zero server configuration, and throws no "SharedArrayBuffer is not
+  defined" error.
+-->
+<script src="https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js" crossorigin="anonymous"></script>
+
+<script type="text/babel" data-presets="react">
+window.__frameDropReady = true;
+const { useState, useRef, useEffect, useCallback } = React;
+
+/* ---------------- i18n ---------------- */
+const STRINGS = {
+  en: {
+    heroBadge: "100% local · runs in your browser",
+    heroTitle: "Convert video frame rate for TikTok",
+    heroSub: "Drop a video — any codec, any container — pick your resolution and quality, and export a TikTok-ready file — processed entirely on your device.",
+    dropTitle: "Drag & drop your video here",
+    dropSub: "or click to browse your files",
+    dropFormats: "MP4 · MOV · MKV · WEBM · AVI + more (H.264, HEVC/H.265, AV1, VP9, ProRes)",
+    remove: "Remove",
+    fileSize: "File size",
+    resolution: "Resolution",
+    currentFps: "Current FPS",
+    duration: "Duration",
+    codec: "Source codec",
+    detecting: "Detecting…",
+    settingsTitle: "Conversion settings",
+    resolutionLabel: "Output resolution",
+    res1080: "1080p Full HD (Recommended for TikTok)",
+    res1440: "2K (1440p)",
+    res4k: "4K Ultra HD",
+    resOriginal: "Original Resolution",
+    fpsLabel: "Frame rate (FPS)",
+    fps30: "30 FPS (Recommended — bypasses TikTok's heavy compression)",
+    fps60: "60 FPS",
+    fps120: "120 FPS",
+    qualityLabel: "Quality preset (CRF)",
+    crf18: "CRF 18 — Ultra / Patch App Quality (high bitrate & sharpness)",
+    crf20: "CRF 20 — Balanced",
+    crf23: "CRF 23 — Standard",
+    outputPreview: "Output will be",
+    patchNote: "CRF 18 is a constant-quality encode, not a bitrate cap — detail and sharpness stay as close to the source as possible before TikTok applies its own compression. This is the same principle apps like Patch use.",
+    convertBtn: "Convert Video",
+    convertingBtn: "Converting…",
+    stepEngine: "Loading conversion engine (first time only)…",
+    stepAnalyzing: "Analyzing video…",
+    stepConverting: "Converting…",
+    stepConvertingChunk: "Converting segment {i} of {n}…",
+    stepStitching: "Stitching segments together…",
+    stepFinalizing: "Finalizing output…",
+    stepDone: "Done!",
+    resultTitle: "Your converted video",
+    original: "Original",
+    converted: "Converted",
+    smaller: "{pct}% smaller",
+    larger: "{pct}% larger",
+    download: "Download Converted Video",
+    convertAnother: "Convert another video",
+    errorGeneric: "Couldn't process this file. It may use an unusual encoding, or the clip may need to be shorter for your browser's available memory. Try a shorter clip, close other tabs, or lower the output resolution.",
+    errorOOM: "Your browser ran out of memory partway through. This is a browser limit (~2GB of usable WASM memory), not a codec problem. Try: trimming the clip shorter, closing other tabs, switching to Chrome, or choosing a lower output resolution.",
+    errorCodec: "FFmpeg couldn't find a decoder for this file's specific codec/profile in the build used by this app. That's a codec-support limit of the WebAssembly build itself, not a file or memory problem — try re-exporting the clip as H.264, or open it in a desktop app instead.",
+    unsupportedFormat: "That doesn't look like a video file. FrameDrop reads virtually any container (.mp4, .mov, .mkv, .webm, .avi, .ts, .flv, .wmv, .m4v…) — try a different file.",
+    localNote: "Your video is processed entirely on your device using WebAssembly FFmpeg. Nothing is uploaded.",
+    fpsAlready: "This video is already at or below {fps} FPS.",
+    largeFileTitle: "Large file detected",
+    largeFileWarn: "This file is {size}. Even with segment-by-segment processing (below), the browser still has to hold the whole input file in WebAssembly memory at once — a hard ~2GB ceiling for a page opened by double-click. That's fine for typical gaming clips; multi-gigabyte recordings may need trimming first. For the best chance of success: use Chrome, close other tabs, and prefer 1080p over 4K/Original.",
+    chunkModeNote: "This file is large enough that FrameDrop will automatically split it into ~{sec}-second segments, convert each one separately, then stitch them back together with no re-encode. That keeps peak memory bounded to one segment at a time instead of the whole clip.",
+    detailsShow: "Show technical details",
+    detailsHide: "Hide technical details",
+  },
+  ar: {
+    heroBadge: "١٠٠٪ محليًا · يعمل داخل متصفحك",
+    heroTitle: "حوّل معدل إطارات الفيديو لتيك توك",
+    heroSub: "ارفع أي فيديو — أي ترميز وأي حاوية — اختر الدقة والجودة، واحصل على ملف جاهز لتيك توك — تتم المعالجة بالكامل على جهازك.",
+    dropTitle: "اسحب وأفلت الفيديو هنا",
+    dropSub: "أو اضغط لاختيار ملف من جهازك",
+    dropFormats: "MP4 · MOV · MKV · WEBM · AVI ‏+ المزيد (H.264, HEVC/H.265, AV1, VP9, ProRes)",
+    remove: "إزالة",
+    fileSize: "حجم الملف",
+    resolution: "الدقة",
+    currentFps: "معدل الإطارات الحالي",
+    duration: "المدة",
+    codec: "ترميز المصدر",
+    detecting: "جارِ الكشف…",
+    settingsTitle: "إعدادات التحويل",
+    resolutionLabel: "دقة الإخراج",
+    res1080: "1080p فل إتش دي (موصى به لتيك توك)",
+    res1440: "2K (1440p)",
+    res4k: "4K ألترا إتش دي",
+    resOriginal: "الدقة الأصلية",
+    fpsLabel: "معدل الإطارات (FPS)",
+    fps30: "30 إطار (موصى به — يتجاوز ضغط تيك توك القوي)",
+    fps60: "60 إطار",
+    fps120: "120 إطار",
+    qualityLabel: "إعداد الجودة (CRF)",
+    crf18: "CRF 18 — جودة فائقة / بمستوى تطبيق باتش (معدل بت وحدة عالية)",
+    crf20: "CRF 20 — متوازن",
+    crf23: "CRF 23 — قياسي",
+    outputPreview: "سيكون الإخراج",
+    patchNote: "CRF 18 هو ترميز بجودة ثابتة وليس بحد أقصى لمعدل البت — فتبقى التفاصيل والحدة قريبة قدر الإمكان من المصدر قبل أن يطبّق تيك توك ضغطه الخاص. هذا هو نفس المبدأ الذي تستخدمه تطبيقات مثل باتش.",
+    convertBtn: "تحويل الفيديو",
+    convertingBtn: "جارٍ التحويل…",
+    stepEngine: "جارِ تحميل محرك التحويل (أول مرة فقط)…",
+    stepAnalyzing: "جارِ تحليل الفيديو…",
+    stepConverting: "جارِ التحويل…",
+    stepConvertingChunk: "جارِ تحويل الجزء {i} من {n}…",
+    stepStitching: "جارِ دمج الأجزاء…",
+    stepFinalizing: "جارِ إنهاء المعالجة…",
+    stepDone: "تم!",
+    resultTitle: "الفيديو بعد التحويل",
+    original: "الأصلي",
+    converted: "بعد التحويل",
+    smaller: "أصغر بنسبة {pct}٪",
+    larger: "أكبر بنسبة {pct}٪",
+    download: "تحميل الفيديو المحوَّل",
+    convertAnother: "تحويل فيديو آخر",
+    errorGeneric: "تعذّرت معالجة هذا الملف. قد يستخدم ترميزًا غير مألوف، أو قد يحتاج المقطع إلى أن يكون أقصر بما يتناسب مع ذاكرة متصفحك المتاحة. جرّب مقطعًا أقصر، أو أغلق تبويبات أخرى، أو اخفض دقة الإخراج.",
+    errorOOM: "نفدت ذاكرة متصفحك أثناء المعالجة. هذا حد خاص بالمتصفح (حوالي 2 جيجابايت من ذاكرة WASM المتاحة) وليس مشكلة في الترميز. جرّب: تقصير المقطع، إغلاق تبويبات أخرى، استخدام متصفح Chrome، أو اختيار دقة إخراج أقل.",
+    errorCodec: "تعذّر على FFmpeg العثور على مُفكِّك (decoder) لترميز/بروفايل هذا الملف تحديدًا ضمن النسخة المستخدمة في هذا التطبيق. هذا حدّ في دعم الترميزات داخل نسخة WebAssembly نفسها، وليس مشكلة في الملف أو الذاكرة — جرّب إعادة تصدير المقطع بترميز H.264، أو افتحه في برنامج على جهازك بدلاً من ذلك.",
+    unsupportedFormat: "هذا لا يبدو ملف فيديو. يقرأ FrameDrop تقريبًا أي حاوية (‎.mp4، ‎.mov، ‎.mkv، ‎.webm، ‎.avi، ‎.ts، ‎.flv، ‎.wmv، ‎.m4v…) — جرّب ملفًا آخر.",
+    localNote: "تتم معالجة الفيديو بالكامل على جهازك باستخدام FFmpeg عبر WebAssembly. لا يتم رفع أي شيء لأي خادم.",
+    fpsAlready: "هذا الفيديو بمعدل {fps} إطار أو أقل بالفعل.",
+    largeFileTitle: "تم اكتشاف ملف كبير",
+    largeFileWarn: "حجم هذا الملف {size}. حتى مع المعالجة على أجزاء (أدناه)، يجب أن يحتفظ المتصفح بالملف الكامل في ذاكرة WebAssembly دفعة واحدة — وهو حدّ ثابت يبلغ حوالي 2 جيجابايت لصفحة مفتوحة بالنقر المزدوج. هذا لا يشكّل مشكلة لمقاطع الألعاب المعتادة؛ أما التسجيلات متعددة الجيجابايتات فقد تحتاج للتقصير أولاً. لأفضل فرصة للنجاح: استخدم Chrome، أغلق تبويبات أخرى، وفضّل 1080p على 4K/الدقة الأصلية.",
+    chunkModeNote: "هذا الملف كبير بما يكفي ليقوم FrameDrop تلقائيًا بتقسيمه إلى أجزاء مدة كل منها حوالي {sec} ثانية، وتحويل كل جزء على حدة، ثم دمجها معًا دون إعادة ترميز. هذا يُبقي أقصى استخدام للذاكرة محدودًا بجزء واحد بدلاً من المقطع كاملاً.",
+    detailsShow: "إظهار التفاصيل التقنية",
+    detailsHide: "إخفاء التفاصيل التقنية",
+  }
+};
+
+function fmt(str, vars){ return Object.keys(vars || {}).reduce((s,k)=> s.replace(`{${k}}`, vars[k]), str); }
+
+/* ---------------- helpers ---------------- */
+// Extensions FFmpeg's demuxers read natively — the whitelist only exists to
+// reject obviously-non-video files early with a friendly message; the actual
+// codec/container support comes from FFmpeg itself, not this list. Any file
+// whose extension is missing here but whose MIME type starts with "video/"
+// is still accepted (see handleFile).
+const ALLOWED_EXT = [
+  "mp4","m4v","mov","mkv","avi","webm","ts","mts","m2ts",
+  "flv","wmv","3gp","3g2","mxf","mpg","mpeg","vob","ogv","asf"
+];
+const CORE_URL = "https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js";
+const LONG_EDGE = { "1080p": 1920, "1440p": 2560, "4k": 3840 };
+const PRESET_BY_CRF = { 18: "slow", 20: "medium", 23: "fast" };
+// Friendly labels for the codec name FFmpeg reports while probing, so users
+// recording with ShadowPlay/GeForce Experience (HEVC), OBS (H.264/AV1), or
+// exporting from an editor (ProRes) can see their source was recognized.
+const CODEC_LABELS = {
+  h264: "H.264 / AVC", hevc: "HEVC / H.265", h265: "HEVC / H.265",
+  av1: "AV1", vp9: "VP9", vp8: "VP8",
+  prores: "Apple ProRes", mpeg4: "MPEG-4", msmpeg4v3: "MPEG-4 (DivX/Xvid)",
+  mpeg2video: "MPEG-2", mpeg1video: "MPEG-1", theora: "Theora",
+  vc1: "VC-1 / WMV", wmv3: "WMV", flv1: "FLV1", dvvideo: "DV",
+  huffyuv: "HuffYUV", ffv1: "FFV1 (lossless)",
+};
+// A double-clicked file:// page can't set COOP/COEP, so this must stay on
+// the single-threaded FFmpeg core (no SharedArrayBuffer / multithreading).
+// That single 32-bit WASM heap tops out at roughly 2GB of *usable* memory
+// in Chrome (less in other browsers) no matter how the app is written —
+// this is a hard browser/WASM ceiling, not a bug we can code around. We
+// surface it proactively instead of pretending it doesn't exist.
+const LARGE_FILE_WARN_BYTES = 1.8 * 1024 * 1024 * 1024;
+
+// --- Chunked-processing config ---
+// Above this size we split the job into segments and transcode each one
+// separately (see convert()). This is what actually lets large/high-bitrate
+// gaming clips (ShadowPlay HEVC, etc.) finish instead of hitting the WASM
+// memory ceiling: peak memory becomes bounded by ONE segment's decode +
+// encode buffers, not the whole clip's. It does NOT lift the ceiling on
+// holding the raw input bytes themselves — see largeFileWarn above.
+const CHUNK_FILE_THRESHOLD_BYTES = 40 * 1024 * 1024; // 40MB
+// Shorter segments for heavier output settings (4K/original decode+encode
+// buffers are much bigger per frame than 1080p), so peak memory per segment
+// stays roughly comparable across resolution choices.
+const CHUNK_SECONDS_BY_RES = { "4k": 8, original: 8, "1440p": 12, "1080p": 20 };
+// Caps the number of ffmpeg.run() calls for very long recordings (each call
+// has fixed overhead); if a duration would need more than this many chunks
+// at the resolution's normal chunk length, we lengthen chunks instead.
+const MAX_CHUNKS = 120;
+
+function bytesToSize(bytes){
+  if(!bytes && bytes !== 0) return "—";
+  const units = ["B","KB","MB","GB"];
+  let i = 0, n = bytes;
+  while(n >= 1024 && i < units.length-1){ n/=1024; i++; }
+  return `${n.toFixed(n < 10 && i>0 ? 2 : 1)} ${units[i]}`;
+}
+function fmtDuration(sec){
+  if(!sec && sec !== 0) return "—";
+  const m = Math.floor(sec/60), s = Math.round(sec%60);
+  return `${m}:${String(s).padStart(2,"0")}`;
+}
+// Computes explicit, even output dimensions preserving aspect ratio & orientation.
+function computeTargetDims(resKey, srcW, srcH){
+  if(resKey === "original" || !srcW || !srcH) return null;
+  const longEdge = LONG_EDGE[resKey];
+  const isLandscape = srcW >= srcH;
+  let w, h;
+  if(isLandscape){ w = longEdge; h = Math.round(srcH * (longEdge / srcW)); }
+  else { h = longEdge; w = Math.round(srcW * (longEdge / srcH)); }
+  w = w % 2 === 0 ? w : w + 1;
+  h = h % 2 === 0 ? h : h + 1;
+  return { w, h };
+}
+// Parses FFmpeg's own stderr probe log for duration + resolution, as a
+// fallback for containers/codecs the browser's <video> tag can't preview
+// (very common for HEVC/MKV sources — Chrome frequently can't render them
+// natively even though FFmpeg can decode them fine), and for FPS/codec name.
+function parseProbeLog(joined){
+  const fpsMatch = joined.match(/(\d+(?:\.\d+)?)\s*fps/);
+  const detectedFps = fpsMatch ? Math.round(parseFloat(fpsMatch[1])) : null;
+  const codecMatch = joined.match(/Video:\s*([a-zA-Z0-9_]+)/);
+  const codecKey = codecMatch ? codecMatch[1].toLowerCase() : null;
+  const codecLabel = codecKey ? (CODEC_LABELS[codecKey] || codecKey.toUpperCase()) : null;
+  const durMatch = joined.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+  const probedDuration = durMatch
+    ? (parseInt(durMatch[1],10)*3600 + parseInt(durMatch[2],10)*60 + parseFloat(durMatch[3]))
+    : null;
+  const videoLine = joined.split("\n").find(l => /Video:/.test(l)) || "";
+  const dimMatch = videoLine.match(/(\d{2,5})x(\d{2,5})/);
+  const probedWidth = dimMatch ? parseInt(dimMatch[1],10) : null;
+  const probedHeight = dimMatch ? parseInt(dimMatch[2],10) : null;
+  return { detectedFps, codecLabel, probedDuration, probedWidth, probedHeight };
+}
+
+function Icon({ name, className }) {
+  useEffect(() => {
+    if (window.lucide) window.lucide.createIcons();
+  });
+  return <i data-lucide={name} className={className}></i>;
+}
+
+/* ---------------- App ---------------- */
+function App(){
+  const [lang, setLang] = useState("en");
+  const t = (key, vars) => fmt(STRINGS[lang][key], vars);
+  const dir = lang === "ar" ? "rtl" : "ltr";
+
+  useEffect(() => {
+    document.body.setAttribute("dir", dir);
+    document.body.classList.toggle("font-tajawal", lang === "ar");
+    document.body.classList.toggle("font-inter", lang !== "ar");
+    document.title = lang === "ar" ? "فريم دروب · تحويل معدل الإطارات" : "FrameDrop · TikTok-Ready Frame Rate Converter";
+  }, [dir, lang]);
+
+  const [file, setFile] = useState(null);
+  const [videoUrl, setVideoUrl] = useState(null);
+  const [info, setInfo] = useState({ width:null, height:null, fps:null, duration:null, probedDuration:null, codec:null });
+  const [fpsLoading, setFpsLoading] = useState(false);
+
+  const [resolution, setResolution] = useState("1080p"); // 1080p | 1440p | 4k | original
+  const [targetFps, setTargetFps] = useState(30);
+  const [crf, setCrf] = useState(18);
+
+  const [status, setStatus] = useState("idle"); // idle | busy | done | error
+  const [stepKey, setStepKey] = useState(null);
+  const [chunkInfo, setChunkInfo] = useState(null); // { index, total } while in chunked mode
+  const [progress, setProgress] = useState(0);
+  const [errorMsg, setErrorMsg] = useState(null);
+  const [errorDetail, setErrorDetail] = useState(null);
+  const [showDetail, setShowDetail] = useState(false);
+
+  const [outputUrl, setOutputUrl] = useState(null);
+  const [outputSize, setOutputSize] = useState(null);
+  const [outputDims, setOutputDims] = useState(null);
+
+  const [dragActive, setDragActive] = useState(false);
+
+  const ffmpegRef = useRef(null);
+  const loadedRef = useRef(false);
+  const fileInputRef = useRef(null);
+  // Tracks the file already written into FFmpeg's in-memory FS, so a large
+  // file is only ever copied into WASM memory once (probe + convert reuse
+  // it) instead of twice — this alone roughly halves peak memory and time
+  // for big gaming recordings compared to writing it for each pass.
+  const memfsRef = useRef(null); // { name }
+
+  const getFFmpeg = useCallback(async () => {
+    if(!ffmpegRef.current){
+      const { createFFmpeg } = FFmpeg;
+      ffmpegRef.current = createFFmpeg({ log: false, corePath: CORE_URL });
+    }
+    if(!loadedRef.current){
+      await ffmpegRef.current.load();
+      loadedRef.current = true;
+    }
+    return ffmpegRef.current;
+  }, []);
+
+  // For large jobs we hand the conversion a brand-new FFmpeg instance
+  // instead of reusing whatever's already loaded. Each createFFmpeg() call
+  // spins up its own dedicated Web Worker with its own independent WASM
+  // linear memory, so this guarantees the big job starts on a completely
+  // unfragmented heap rather than one that may have accumulated growth
+  // from an earlier probe pass or a previous conversion this session.
+  // Deliberately NOT calling ffmpeg.exit() on the old instance first: it's
+  // a documented footgun in ffmpeg.wasm 0.11.x (upstream issues #242, #271)
+  // that can throw and leave an instance permanently stuck — worse than
+  // just letting the old worker be garbage-collected once unreferenced.
+  const freshFFmpeg = useCallback(async () => {
+    const { createFFmpeg } = FFmpeg;
+    ffmpegRef.current = createFFmpeg({ log: false, corePath: CORE_URL });
+    loadedRef.current = false;
+    memfsRef.current = null;
+    await ffmpegRef.current.load();
+    loadedRef.current = true;
+    return ffmpegRef.current;
+  }, []);
+
+  const resetOutput = () => {
+    if(outputUrl) URL.revokeObjectURL(outputUrl);
+    setOutputUrl(null); setOutputSize(null); setOutputDims(null);
+    setStatus("idle"); setProgress(0); setStepKey(null); setChunkInfo(null);
+    setErrorMsg(null); setErrorDetail(null); setShowDetail(false);
+  };
+
+  const clearMemfs = (ffmpeg) => {
+    if(memfsRef.current && ffmpeg){
+      try { ffmpeg.FS("unlink", memfsRef.current.name); } catch(e){}
+    }
+    memfsRef.current = null;
+  };
+
+  const handleFile = async (f) => {
+    if(!f) return;
+    const ext = (f.name.split(".").pop() || "").toLowerCase();
+    const looksLikeVideo = f.type && f.type.startsWith("video/");
+    // The extension list is just a fast, friendly pre-check — anything that
+    // reports a video/* MIME type is let through too, since FFmpeg's own
+    // demuxers (not this app) decide what containers/codecs actually work.
+    if(!ALLOWED_EXT.includes(ext) && !looksLikeVideo){
+      setErrorMsg(t("unsupportedFormat"));
+      setStatus("error");
+      return;
+    }
+    resetOutput();
+    if(videoUrl) URL.revokeObjectURL(videoUrl);
+    // Free any previous file's WASM memory before we load a new one.
+    clearMemfs(ffmpegRef.current);
+    const url = URL.createObjectURL(f);
+    setFile(f);
+    setVideoUrl(url);
+    setInfo({ width:null, height:null, fps:null, duration:null, probedDuration:null, codec:null });
+    setStatus("idle");
+
+    setFpsLoading(true);
+    try {
+      setStepKey("stepEngine");
+      const ffmpeg = await getFFmpeg();
+      const { fetchFile } = FFmpeg;
+      const safeExt = /^[a-z0-9]{1,5}$/.test(ext) ? ext : "bin";
+      const inputName = `input.${safeExt}`;
+      let logBuffer = [];
+      ffmpeg.setLogger(({ message }) => logBuffer.push(message));
+      // Written once here; convert() reuses this exact file from MEMFS
+      // instead of re-reading + re-writing the whole thing a second time.
+      ffmpeg.FS("writeFile", inputName, await fetchFile(f));
+      memfsRef.current = { name: inputName };
+      try {
+        // Large analyzeduration/probesize handles game-capture files with
+        // odd timestamps or a moov atom that isn't fully finalized yet
+        // (common right after ShadowPlay/OBS stops recording).
+        await ffmpeg.run("-analyzeduration", "200M", "-probesize", "200M", "-i", inputName);
+      } catch (e) { /* expected: no output file given, this is just a probe */ }
+      ffmpeg.setLogger(() => {});
+
+      const joined = logBuffer.join("\n");
+      const { detectedFps, codecLabel, probedDuration, probedWidth, probedHeight } = parseProbeLog(joined);
+      // Only fill in width/height/duration from the FFmpeg probe if the
+      // <video> tag hasn't already reported them — this is the fallback
+      // path for containers Chrome's native player can't preview (very
+      // common for HEVC/MKV sources) but FFmpeg can still decode fine.
+      setInfo(prev => ({
+        ...prev,
+        fps: detectedFps,
+        codec: codecLabel,
+        probedDuration,
+        width: prev.width || probedWidth,
+        height: prev.height || probedHeight,
+      }));
+    } catch (e) {
+      console.error(e);
+      // Probing failed outright — don't leave a half-written huge file
+      // sitting in WASM memory.
+      clearMemfs(ffmpegRef.current);
+    } finally {
+      setFpsLoading(false);
+      setStepKey(null);
+    }
+  };
+
+  const onVideoMeta = (e) => {
+    const v = e.target;
+    if(!v.videoWidth) return; // some containers fire this event with nothing useful — keep the probed fallback
+    setInfo(prev => ({ ...prev, width: v.videoWidth, height: v.videoHeight, duration: isFinite(v.duration) ? v.duration : prev.duration }));
+  };
+
+  const onDrop = (e) => {
+    e.preventDefault(); setDragActive(false);
+    const f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if(f) handleFile(f);
+  };
+
+  const convert = async () => {
+    if(!file) return;
+    setStatus("busy");
+    setErrorMsg(null); setErrorDetail(null); setShowDetail(false);
+    setProgress(0);
+    setChunkInfo(null);
+    let logBuffer = [];
+    const segmentFiles = [];
+    try {
+      setStepKey("stepEngine");
+      const ext = (file.name.split(".").pop() || "").toLowerCase();
+      const safeExt = /^[a-z0-9]{1,5}$/.test(ext) ? ext : "bin";
+      const outputName = "output.mp4";
+
+      // Files above the threshold get a completely fresh FFmpeg instance
+      // (see freshFFmpeg above) so the big job starts on a clean heap.
+      const shouldChunk = file.size > CHUNK_FILE_THRESHOLD_BYTES;
+      const ffmpeg = shouldChunk ? await freshFFmpeg() : await getFFmpeg();
+      const { fetchFile } = FFmpeg;
+
+      setStepKey("stepAnalyzing");
+      let inputName = memfsRef.current && memfsRef.current.name;
+      if(!inputName){
+        inputName = `input.${safeExt}`;
+        ffmpeg.FS("writeFile", inputName, await fetchFile(file));
+        memfsRef.current = { name: inputName };
+      }
+
+      ffmpeg.setLogger(({ message }) => {
+        logBuffer.push(message);
+        if(logBuffer.length > 400) logBuffer.shift(); // bounded, avoid unbounded growth on long clips
+      });
+
+      // --- Frame reduction + resolution logic ---
+      // Scale is applied FIRST in the filter chain (when downscaling), so
+      // every later filter (format conversion, fps drop) works on the
+      // already-smaller frame — this materially lowers intermediate memory
+      // for a 4K/HEVC source being brought down to 1080p, versus scaling
+      // last after those filters already buffered full-resolution frames.
+      // "fps=N" performs true frame *dropping/resampling* (nearest-frame
+      // selection), never blending/interpolating, so motion isn't smeared.
+      // "format=yuv420p" is a safety net for HEVC/AV1/ProRes sources that
+      // decode to 10-bit or 4:2:2/4:4:4 sample formats libx264 can't accept
+      // directly — a no-op for already-8-bit 4:2:0 sources.
+      const dims = computeTargetDims(resolution, info.width, info.height);
+      const vfParts = [];
+      // Lanczos resampling (vs. the default bilinear) keeps edges and fine
+      // detail sharp when downscaling to 1080p, and avoids the soft/blurred
+      // chroma edges ("color bleeding") that cheaper scalers introduce.
+      if(dims) vfParts.push(`scale=${dims.w}:${dims.h}:flags=lanczos`);
+      vfParts.push("format=yuv420p", `fps=${targetFps}`);
+      const vf = vfParts.join(",");
+
+      // Cap x264's lookahead buffer for big/slow encodes (4K + CRF18/"slow")
+      // so the encoder's own internal frame queue doesn't compound the
+      // memory pressure that a large decoded source already puts on the
+      // single WASM heap. Smaller resolutions/faster presets don't need it.
+      const isHeavy = (resolution === "4k" || resolution === "original") && crf === 18;
+      const x264Params = isHeavy ? ["-x264-params", "rc-lookahead=24:ref=3"] : [];
+      const preset = PRESET_BY_CRF[crf] || "medium";
+
+      const commonEncodeArgs = [
+        "-vf", vf,
+        "-c:v", "libx264",
+        "-preset", preset,
+        "-crf", String(crf),
+        ...x264Params,
+        "-profile:v", "high",
+        "-g", String(targetFps * 2),
+        "-pix_fmt", "yuv420p",
+        // Explicitly stamp standard-dynamic-range Rec.709 color metadata
+        // (primaries/transfer/matrix) and full "tv"-range levels into the
+        // output stream. Sources with no tags at all — very common for
+        // screen/game captures — otherwise leave players and TikTok's own
+        // transcoder to guess, which is the usual cause of washed-out or
+        // oversaturated color after re-encoding. This forces a consistent,
+        // correct color pipeline instead of an implicit guess.
+        "-color_primaries", "bt709",
+        "-color_trc", "bt709",
+        "-colorspace", "bt709",
+        "-color_range", "tv",
+        // Forces single-threaded decode/encode explicitly, rather than
+        // leaving thread-count autodetection to guess based on the host's
+        // logical CPU count — keeps behavior deterministic and avoids any
+        // extra per-thread buffer overhead in the single-threaded WASM core.
+        "-threads", "1",
+        // High-bitrate AAC keeps the original audio perceptually intact —
+        // audio is never dropped or replaced, only re-encoded so it's
+        // guaranteed to play back correctly inside an MP4 container
+        // (many source containers carry audio codecs MP4/TikTok reject).
+        "-c:a", "aac",
+        "-b:a", "256k",
+        "-ar", "48000",
+      ];
+
+      const bestDuration = (info.duration && isFinite(info.duration)) ? info.duration : info.probedDuration;
+
+      let chunkSeconds = CHUNK_SECONDS_BY_RES[resolution] || 15;
+      let numChunks = (shouldChunk && bestDuration) ? Math.max(1, Math.ceil(bestDuration / chunkSeconds)) : 1;
+      if(numChunks > MAX_CHUNKS){
+        chunkSeconds = Math.ceil(bestDuration / MAX_CHUNKS);
+        numChunks = Math.ceil(bestDuration / chunkSeconds);
+      }
+
+      if(numChunks <= 1){
+        // ----- Single-pass path: short/small clips, or duration unknown -----
+        setStepKey("stepConverting");
+        ffmpeg.setProgress(({ ratio }) => {
+          if(typeof ratio === "number" && !isNaN(ratio)) setProgress(Math.max(0, Math.min(100, Math.round(ratio*100))));
+        });
+        await ffmpeg.run(
+          "-analyzeduration", "100M", "-probesize", "100M",
+          "-fflags", "+genpts+igndts",
+          "-i", inputName,
+          ...commonEncodeArgs,
+          "-movflags", "+faststart",
+          outputName
+        );
+      } else {
+        // ----- Chunked path: transcode fixed-length segments, then
+        // stitch with a stream-copy concat (no re-encode, so it's fast and
+        // near-zero extra memory). Peak memory during the loop is bounded
+        // by ONE segment's decode+encode buffers, not the whole clip's —
+        // this is what actually lets large/long HEVC gaming clips finish. -----
+        for(let i=0; i<numChunks; i++){
+          const startTime = i * chunkSeconds;
+          const segLen = Math.min(chunkSeconds, bestDuration - startTime);
+          if(segLen <= 0) break;
+          const segName = `seg_${String(i).padStart(4,"0")}.mp4`;
+          segmentFiles.push(segName);
+
+          setStepKey("stepConvertingChunk");
+          setChunkInfo({ index: i+1, total: numChunks });
+          ffmpeg.setProgress(({ ratio }) => {
+            if(typeof ratio === "number" && !isNaN(ratio)){
+              const chunkFrac = Math.max(0, Math.min(1, ratio));
+              setProgress(Math.round(((i + chunkFrac) / numChunks) * 100));
+            }
+          });
+
+          await ffmpeg.run(
+            "-analyzeduration", "50M", "-probesize", "50M",
+            "-ss", String(startTime),
+            "-i", inputName,
+            "-t", String(segLen),
+            ...commonEncodeArgs,
+            segName
+          );
+        }
+
+        setStepKey("stepStitching");
+        setChunkInfo(null);
+        ffmpeg.setProgress(() => {});
+        const listContent = segmentFiles.map(n => `file '${n}'`).join("\n");
+        ffmpeg.FS("writeFile", "concat_list.txt", new TextEncoder().encode(listContent));
+        await ffmpeg.run(
+          "-f", "concat", "-safe", "0",
+          "-i", "concat_list.txt",
+          "-c", "copy",
+          "-movflags", "+faststart",
+          outputName
+        );
+      }
+
+      setStepKey("stepFinalizing");
+      const data = ffmpeg.FS("readFile", outputName);
+      const blob = new Blob([data.buffer], { type: "video/mp4" });
+      const url = URL.createObjectURL(blob);
+
+      try { ffmpeg.FS("unlink", outputName); } catch(e){}
+      segmentFiles.forEach(n => { try { ffmpeg.FS("unlink", n); } catch(e){} });
+      try { ffmpeg.FS("unlink", "concat_list.txt"); } catch(e){}
+      clearMemfs(ffmpeg); // free the (possibly huge) input from WASM memory now that we're done with it
+
+      setOutputUrl(url);
+      setOutputSize(blob.size);
+      setOutputDims(dims || { w: info.width, h: info.height });
+      setProgress(100);
+      setStepKey("stepDone");
+      setStatus("done");
+    } catch (e) {
+      console.error(e, logBuffer.join("\n"));
+      const tail = logBuffer.slice(-14).join("\n");
+      const joined = (logBuffer.join("\n") + " " + String(e && e.message || e)).toLowerCase();
+      const isOOM = /out of memory|memory access out of bounds|aborted\(|allocation failed/.test(joined);
+      const isCodec = /decoder not found|unknown decoder|unable to find a suitable output format|invalid data found when processing input/.test(joined);
+      setErrorMsg(isOOM ? t("errorOOM") : (isCodec ? t("errorCodec") : t("errorGeneric")));
+      setErrorDetail(tail || String(e && e.message || e));
+      setStatus("error");
+    }
+  };
+
+  const removeFile = () => {
+    if(videoUrl) URL.revokeObjectURL(videoUrl);
+    if(outputUrl) URL.revokeObjectURL(outputUrl);
+    clearMemfs(ffmpegRef.current);
+    setFile(null); setVideoUrl(null);
+    setInfo({ width:null, height:null, fps:null, duration:null, probedDuration:null, codec:null });
+    setOutputUrl(null); setOutputSize(null); setOutputDims(null);
+    setStatus("idle"); setProgress(0); setStepKey(null); setChunkInfo(null);
+    setErrorMsg(null); setErrorDetail(null); setShowDetail(false);
+    if(fileInputRef.current) fileInputRef.current.value = "";
+  };
+
+  const pct = (outputSize && file) ? Math.round(((file.size - outputSize) / file.size) * 100) : 0;
+  const previewDims = computeTargetDims(resolution, info.width, info.height);
+  const bestDurationDisplay = (info.duration && isFinite(info.duration)) ? info.duration : info.probedDuration;
+  const willChunk = file && file.size > CHUNK_FILE_THRESHOLD_BYTES;
+  const chunkSecondsDisplay = CHUNK_SECONDS_BY_RES[resolution] || 15;
+
+  const selectCls = "w-full bg-card border border-gray-700 text-gray-100 text-sm font-semibold rounded-xl px-4 py-3 outline-none focus:ring-2 focus:ring-violet-500 focus:border-violet-500 cursor-pointer";
+  const labelCls = "text-sm font-semibold text-gray-400 block mb-2";
+
+  return (
+    <div className="max-w-3xl mx-auto px-5 pt-7 pb-20">
+      <header className="flex items-center justify-between mb-8">
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-violet-500 to-cyan-400 flex items-center justify-center shadow-lg shadow-violet-500/40 shrink-0">
+            <Icon name="film" className="w-5 h-5 text-ink" />
+          </div>
+          <div className="font-extrabold text-lg tracking-tight">
+            Frame<span className="bg-gradient-to-br from-violet-400 to-cyan-400 bg-clip-text text-transparent">Drop</span>
+          </div>
+        </div>
+        <div className="flex bg-card/70 border border-white/10 rounded-full p-0.5 backdrop-blur-md">
+          <button
+            className={`text-xs font-semibold px-3.5 py-1.5 rounded-full transition-all ${lang==="en" ? "bg-gradient-to-br from-violet-500 to-cyan-400 text-ink" : "text-gray-400"}`}
+            onClick={()=>setLang("en")}
+          >EN</button>
+          <button
+            className={`text-xs font-semibold px-3.5 py-1.5 rounded-full transition-all ${lang==="ar" ? "bg-gradient-to-br from-violet-500 to-cyan-400 text-ink" : "text-gray-400"}`}
+            onClick={()=>setLang("ar")}
+          >عربي</button>
+        </div>
+      </header>
+
+      <div className="text-center mb-8">
+        <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-cyan-300 bg-cyan-400/10 border border-cyan-400/25 rounded-full px-3 py-1.5 mb-4 backdrop-blur-md shadow-[0_0_18px_-6px_rgba(0,242,254,0.4)]">
+          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_theme(colors.emerald.400)] animate-pulse"></span>
+          {t("heroBadge")}
+        </div>
+        <h1 className="text-3xl font-extrabold tracking-tight mb-2">{t("heroTitle")}</h1>
+        <p className="text-gray-400 text-[15px] leading-relaxed">{t("heroSub")}</p>
+      </div>
+
+      {!file && (
+        <div
+          className={`border-2 border-dashed rounded-2xl px-6 py-11 text-center cursor-pointer transition-all duration-300 backdrop-blur-xl ${dragActive ? "border-cyan-400 bg-cyan-400/[0.08] shadow-neon scale-[1.01]" : "border-gray-700 bg-white/[0.02] hover:border-violet-500 hover:bg-violet-500/[0.06] hover:shadow-violetGlow hover:-translate-y-0.5"}`}
+          onClick={()=>fileInputRef.current && fileInputRef.current.click()}
+          onDragOver={(e)=>{e.preventDefault(); setDragActive(true);}}
+          onDragLeave={()=>setDragActive(false)}
+          onDrop={onDrop}
+        >
+          <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-violet-500 to-cyan-400 flex items-center justify-center mx-auto mb-4 shadow-neon">
+            <Icon name="upload-cloud" className="w-6 h-6 text-ink" />
+          </div>
+          <div className="font-bold text-base mb-1.5">{t("dropTitle")}</div>
+          <div className="text-gray-400 text-sm mb-3.5">{t("dropSub")}</div>
+          <div className="text-[11px] font-semibold text-gray-500 max-w-xs mx-auto leading-relaxed">
+            {t("dropFormats")}
+          </div>
+          <input
+            ref={fileInputRef} type="file" accept="video/*" className="hidden"
+            onChange={(e)=>handleFile(e.target.files[0])}
+          />
+        </div>
+      )}
+
+      {status === "error" && !file && (
+        <div className="flex items-start gap-2.5 rounded-xl p-3.5 mb-4 text-sm leading-relaxed bg-red-500/10 border border-red-500/30 text-red-300">
+          <Icon name="alert-triangle" className="w-4 h-4 mt-0.5 shrink-0" /> {errorMsg}
+        </div>
+      )}
+
+      {file && (
+        <div className="bg-white/[0.035] border border-white/10 rounded-2xl p-5 mb-4 backdrop-blur-xl shadow-[0_8px_32px_-12px_rgba(0,0,0,0.5)] ring-1 ring-white/5">
+          <div className="flex items-center justify-between gap-2.5 mb-3 flex-wrap">
+            <div className="font-semibold text-sm break-all flex items-center gap-2">
+              <Icon name="video" className="w-4 h-4 text-violet-400" /> {file.name}
+            </div>
+            <button className="flex items-center gap-1 text-xs font-semibold text-gray-400 border border-gray-700 rounded-lg px-3 py-1.5 hover:border-red-400 hover:text-red-400" onClick={removeFile}>
+              <Icon name="x" className="w-3.5 h-3.5" /> {t("remove")}
+            </button>
+          </div>
+          <video className="w-full rounded-xl bg-black block max-h-80" src={videoUrl} controls muted onLoadedMetadata={onVideoMeta} />
+          <div className="grid grid-cols-2 sm:grid-cols-5 gap-2.5 mt-3.5">
+            <div className="bg-card/80 border border-white/10 rounded-xl px-3 py-2.5 backdrop-blur-md hover:border-cyan-400/40 hover:shadow-[0_0_16px_-6px_rgba(0,242,254,0.35)] transition-all">
+              <div className="text-[11px] text-gray-500 font-semibold uppercase tracking-wide mb-0.5">{t("fileSize")}</div>
+              <div className="text-sm font-bold">{bytesToSize(file.size)}</div>
+            </div>
+            <div className="bg-card/80 border border-white/10 rounded-xl px-3 py-2.5 backdrop-blur-md hover:border-cyan-400/40 hover:shadow-[0_0_16px_-6px_rgba(0,242,254,0.35)] transition-all">
+              <div className="text-[11px] text-gray-500 font-semibold uppercase tracking-wide mb-0.5">{t("resolution")}</div>
+              <div className="text-sm font-bold">{info.width ? `${info.width}×${info.height}` : "…"}</div>
+            </div>
+            <div className="bg-card/80 border border-white/10 rounded-xl px-3 py-2.5 backdrop-blur-md hover:border-cyan-400/40 hover:shadow-[0_0_16px_-6px_rgba(0,242,254,0.35)] transition-all">
+              <div className="text-[11px] text-gray-500 font-semibold uppercase tracking-wide mb-0.5">{t("currentFps")}</div>
+              <div className={`text-sm font-bold ${info.fps && info.fps > targetFps ? "text-amber-400" : "text-emerald-400"}`}>
+                {fpsLoading ? t("detecting") : (info.fps ? `${info.fps} fps` : "—")}
+              </div>
+            </div>
+            <div className="bg-card/80 border border-white/10 rounded-xl px-3 py-2.5 backdrop-blur-md hover:border-cyan-400/40 hover:shadow-[0_0_16px_-6px_rgba(0,242,254,0.35)] transition-all">
+              <div className="text-[11px] text-gray-500 font-semibold uppercase tracking-wide mb-0.5">{t("duration")}</div>
+              <div className="text-sm font-bold">{fmtDuration(bestDurationDisplay)}</div>
+            </div>
+            <div className="bg-card/80 border border-white/10 rounded-xl px-3 py-2.5 backdrop-blur-md hover:border-cyan-400/40 hover:shadow-[0_0_16px_-6px_rgba(0,242,254,0.35)] transition-all">
+              <div className="text-[11px] text-gray-500 font-semibold uppercase tracking-wide mb-0.5">{t("codec")}</div>
+              <div className="text-sm font-bold truncate">{fpsLoading ? t("detecting") : (info.codec || "—")}</div>
+            </div>
+          </div>
+          {(!fpsLoading && info.fps && info.fps <= targetFps) && (
+            <div className="flex items-start gap-2.5 rounded-xl p-3.5 mt-3.5 text-sm leading-relaxed bg-cyan-400/[0.08] border border-cyan-400/25 text-cyan-100">
+              <Icon name="info" className="w-4 h-4 mt-0.5 shrink-0" /> {t("fpsAlready", { fps: targetFps })}
+            </div>
+          )}
+          {willChunk && (
+            <div className="flex items-start gap-2.5 rounded-xl p-3.5 mt-3.5 text-sm leading-relaxed bg-violet-500/[0.08] border border-violet-500/30 text-violet-100">
+              <Icon name="scissors" className="w-4 h-4 mt-0.5 shrink-0 text-violet-300" /> {t("chunkModeNote", { sec: chunkSecondsDisplay })}
+            </div>
+          )}
+          {file.size > LARGE_FILE_WARN_BYTES && (
+            <div className="flex items-start gap-2.5 rounded-xl p-3.5 mt-3.5 text-sm leading-relaxed bg-amber-400/[0.08] border border-amber-400/25 text-amber-100">
+              <Icon name="alert-triangle" className="w-4 h-4 mt-0.5 shrink-0" />
+              <span><b className="block mb-0.5">{t("largeFileTitle")}</b>{t("largeFileWarn", { size: bytesToSize(file.size) })}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {file && (
+        <div className="bg-white/[0.035] border border-white/10 rounded-2xl p-5 mb-4 backdrop-blur-xl shadow-[0_8px_32px_-12px_rgba(0,0,0,0.5)] ring-1 ring-white/5">
+          <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">{t("settingsTitle")}</h3>
+
+          <div className="grid sm:grid-cols-3 gap-4">
+            <div>
+              <label className={labelCls}>{t("resolutionLabel")}</label>
+              <select className={selectCls} value={resolution} onChange={(e)=>setResolution(e.target.value)}>
+                <option value="1080p">{t("res1080")}</option>
+                <option value="1440p">{t("res1440")}</option>
+                <option value="4k">{t("res4k")}</option>
+                <option value="original">{t("resOriginal")}</option>
+              </select>
+            </div>
+
+            <div>
+              <label className={labelCls}>{t("fpsLabel")}</label>
+              <select className={selectCls} value={targetFps} onChange={(e)=>setTargetFps(Number(e.target.value))}>
+                <option value={30}>{t("fps30")}</option>
+                <option value={60}>{t("fps60")}</option>
+                <option value={120}>{t("fps120")}</option>
+              </select>
+            </div>
+
+            <div>
+              <label className={labelCls}>{t("qualityLabel")}</label>
+              <select className={selectCls} value={crf} onChange={(e)=>setCrf(Number(e.target.value))}>
+                <option value={18}>{t("crf18")}</option>
+                <option value={20}>{t("crf20")}</option>
+                <option value={23}>{t("crf23")}</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 mt-4 text-xs font-semibold text-gray-500">
+            <Icon name="arrow-right" className="w-3.5 h-3.5 text-violet-400" />
+            <span>{t("outputPreview")}:</span>
+            <span className="text-gray-200">
+              {previewDims ? `${previewDims.w}×${previewDims.h}` : (info.width ? `${info.width}×${info.height}` : "—")} · {targetFps} fps · CRF {crf}
+            </span>
+          </div>
+
+          {crf === 18 && (
+            <div className="flex items-start gap-2.5 rounded-xl p-3.5 mt-4 text-sm leading-relaxed bg-violet-500/[0.08] border border-violet-500/30 text-violet-100">
+              <Icon name="zap" className="w-4 h-4 mt-0.5 shrink-0 text-violet-300" /> {t("patchNote")}
+            </div>
+          )}
+        </div>
+      )}
+
+      {file && status !== "done" && (
+        <div className="bg-white/[0.035] border border-white/10 rounded-2xl p-5 mb-4 backdrop-blur-xl shadow-[0_8px_32px_-12px_rgba(0,0,0,0.5)] ring-1 ring-white/5">
+          {status === "busy" && (
+            <div className="mb-4">
+              <div className="flex items-center justify-between mb-2.5">
+                <span className="flex items-center gap-2 text-sm font-semibold text-gray-400">
+                  <Icon name="loader-2" className="w-4 h-4 animate-spin text-cyan-400" />
+                  {stepKey === "stepConvertingChunk" && chunkInfo
+                    ? t("stepConvertingChunk", { i: chunkInfo.index, n: chunkInfo.total })
+                    : t(stepKey || "stepConverting", { fps: targetFps })}
+                </span>
+                <span className="text-xl font-extrabold tabular-nums bg-gradient-to-br from-violet-400 to-cyan-400 bg-clip-text text-transparent">{progress}%</span>
+              </div>
+              <div className="w-full h-2.5 rounded-full bg-card/80 border border-white/10 overflow-hidden relative">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-violet-500 to-cyan-400 transition-all duration-300 shadow-[0_0_10px_1px_rgba(0,242,254,0.55)]"
+                  style={{width:`${progress}%`}}
+                ></div>
+              </div>
+            </div>
+          )}
+
+          {status === "error" && (
+            <div className="mb-4">
+              <div className="flex items-start gap-2.5 rounded-xl p-3.5 text-sm leading-relaxed bg-red-500/10 border border-red-500/30 text-red-300">
+                <Icon name="alert-triangle" className="w-4 h-4 mt-0.5 shrink-0" /> {errorMsg}
+              </div>
+              {errorDetail && (
+                <div className="mt-2">
+                  <button
+                    className="text-xs font-semibold text-gray-500 hover:text-gray-300 flex items-center gap-1"
+                    onClick={()=>setShowDetail(v=>!v)}
+                  >
+                    <Icon name={showDetail ? "chevron-up" : "chevron-down"} className="w-3.5 h-3.5" />
+                    {showDetail ? t("detailsHide") : t("detailsShow")}
+                  </button>
+                  {showDetail && (
+                    <pre className="mt-2 text-[11px] leading-relaxed text-gray-400 bg-black/40 border border-gray-800 rounded-lg p-3 overflow-x-auto whitespace-pre-wrap break-all max-h-52 overflow-y-auto">{errorDetail}</pre>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          <button
+            className="w-full rounded-2xl py-4 font-extrabold text-[15px] text-ink bg-gradient-to-br from-violet-500 to-cyan-400 shadow-violetGlow hover:-translate-y-0.5 hover:shadow-neon transition-all disabled:opacity-40 disabled:translate-y-0 disabled:shadow-none flex items-center justify-center gap-2"
+            disabled={status==="busy"} onClick={convert}
+          >
+            <Icon name="clapperboard" className="w-4 h-4" />
+            {status==="busy" ? t("convertingBtn") : t("convertBtn")}
+          </button>
+        </div>
+      )}
+
+      {status === "done" && outputUrl && (
+        <div className="bg-white/[0.035] border border-white/10 rounded-2xl p-5 mb-4 backdrop-blur-xl shadow-[0_8px_32px_-12px_rgba(0,0,0,0.5)] ring-1 ring-white/5">
+          <h3 className="text-xs font-bold text-gray-400 uppercase tracking-wider mb-4">{t("resultTitle")}</h3>
+          <video className="w-full rounded-xl bg-black block max-h-80 mb-4" src={outputUrl} controls />
+
+          <div className="flex items-center gap-3.5 my-4 flex-wrap">
+            <div className="flex-1 min-w-[140px] bg-card border border-gray-800 rounded-xl p-3.5 text-center">
+              <div className="text-[11px] text-gray-500 font-bold uppercase tracking-wide mb-1.5">{t("original")}</div>
+              <div className="text-xl font-extrabold">{bytesToSize(file.size)}</div>
+              <div className="text-xs text-gray-500 mt-1">{info.width}×{info.height} · {info.fps || "?"} fps</div>
+            </div>
+            <Icon name="arrow-right" className="w-5 h-5 text-gray-600 rtl:rotate-180" />
+            <div className="flex-1 min-w-[140px] bg-card border border-gray-800 rounded-xl p-3.5 text-center">
+              <div className="text-[11px] text-gray-500 font-bold uppercase tracking-wide mb-1.5">{t("converted")}</div>
+              <div className="text-xl font-extrabold">{bytesToSize(outputSize)}</div>
+              <div className="text-xs text-gray-500 mt-1">{outputDims ? `${outputDims.w}×${outputDims.h}` : "—"} · {targetFps} fps</div>
+              <span className={`inline-flex items-center gap-1.5 font-extrabold text-xs px-3 py-1 rounded-full mt-2 ${pct >= 0 ? "bg-emerald-400/10 text-emerald-400 border border-emerald-400/30" : "bg-amber-400/10 text-amber-400 border border-amber-400/30"}`}>
+                {pct >= 0 ? t("smaller", { pct }) : t("larger", { pct: Math.abs(pct) })}
+              </span>
+            </div>
+          </div>
+
+          <a
+            className="w-full rounded-2xl py-4 font-extrabold text-[15px] text-ink bg-gradient-to-br from-violet-500 to-cyan-400 shadow-violetGlow hover:-translate-y-0.5 hover:shadow-neon transition-all flex items-center justify-center gap-2 no-underline"
+            href={outputUrl} download={`framedrop_${targetFps}fps_crf${crf}_${file.name.replace(/\.[^.]+$/,"")}.mp4`}
+          >
+            <Icon name="download" className="w-4 h-4" /> {t("download")}
+          </a>
+          <button className="w-full rounded-2xl py-3.5 font-bold text-sm mt-2.5 border border-gray-700 bg-card hover:border-cyan-400 hover:text-cyan-400 transition-all" onClick={removeFile}>
+            {t("convertAnother")}
+          </button>
+        </div>
+      )}
+
+      <footer className="text-center text-gray-600 text-xs mt-7 leading-relaxed flex items-center justify-center gap-1.5">
+        <Icon name="lock" className="w-3.5 h-3.5" /> <b className="text-gray-500 font-semibold">{t("localNote")}</b>
+      </footer>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
